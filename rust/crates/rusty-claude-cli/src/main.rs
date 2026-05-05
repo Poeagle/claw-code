@@ -13710,6 +13710,8 @@ enum StdinMessage {
     Session { action: String, session_id: Option<String> },
     #[serde(rename = "cancel")]
     Cancel,
+    #[serde(rename = "get_config")]
+    GetConfig,
 }
 
 fn run_structured_mode(
@@ -13791,6 +13793,15 @@ fn run_structured_mode(
                     });
                     writeln!(std::io::stdout(), "{}", info)?;
                 }
+            }
+            StdinMessage::GetConfig => {
+                let current_model = runtime.session().model.clone().unwrap_or_else(|| model.clone());
+                let config = serde_json::json!({
+                    "type": "config",
+                    "model": current_model,
+                    "session_id": runtime.session().session_id,
+                });
+                writeln!(std::io::stdout(), "{}", config)?;
             }
             StdinMessage::Cancel => {
                 break;

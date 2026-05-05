@@ -7772,6 +7772,7 @@ struct AnthropicRuntimeClient {
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
     reasoning_effort: Option<String>,
+    event_emitter: Option<std::cell::RefCell<Box<dyn EventEmitter>>>,
 }
 
 impl AnthropicRuntimeClient {
@@ -7837,11 +7838,16 @@ impl AnthropicRuntimeClient {
             tool_registry,
             progress_reporter,
             reasoning_effort: None,
+            event_emitter: None,
         })
     }
 
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
         self.reasoning_effort = effort;
+    }
+
+    fn set_event_emitter(&mut self, emitter: Box<dyn EventEmitter>) {
+        self.event_emitter = Some(std::cell::RefCell::new(emitter));
     }
 }
 
@@ -7991,6 +7997,20 @@ impl AnthropicRuntimeClient {
                                     .and_then(|()| out.flush())
                                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                             }
+                            if let Some(emitter) = &self.event_emitter {
+                                let mut emitter = emitter.borrow_mut();
+                                emitter.emit(StructuredEvent {
+                                    r#type: "text".into(),
+                                    text: Some(text.clone()),
+                                    tool_use_id: None,
+                                    tool_name: None,
+                                    tool_input: None,
+                                    tool_output: None,
+                                    is_error: None,
+                                    input_tokens: None,
+                                    output_tokens: None,
+                                });
+                            }
                             events.push(AssistantEvent::TextDelta(text));
                         }
                     }
@@ -8003,6 +8023,20 @@ impl AnthropicRuntimeClient {
                         if !block_has_thinking_summary {
                             render_thinking_block_summary(out, None, false)?;
                             block_has_thinking_summary = true;
+                        }
+                        if let Some(emitter) = &self.event_emitter {
+                                let mut emitter = emitter.borrow_mut();
+                            emitter.emit(StructuredEvent {
+                                r#type: "text".into(),
+                                text: Some(thinking.clone()),
+                                tool_use_id: None,
+                                tool_name: None,
+                                tool_input: None,
+                                tool_output: None,
+                                is_error: None,
+                                input_tokens: None,
+                                output_tokens: None,
+                            });
                         }
                         // Preserve the thinking text so it can be echoed back
                         // to providers that require reasoning_content (e.g. DeepSeek).
@@ -8021,15 +8055,43 @@ impl AnthropicRuntimeClient {
                         if let Some(progress_reporter) = &self.progress_reporter {
                             progress_reporter.mark_tool_phase(&name, &input);
                         }
-                        // Display tool call now that input is fully accumulated
                         writeln!(out, "\n{}", format_tool_call_start(&name, &input))
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        if let Some(emitter) = &self.event_emitter {
+                                let mut emitter = emitter.borrow_mut();
+                            emitter.emit(StructuredEvent {
+                                r#type: "tool_use".into(),
+                                text: None,
+                                tool_use_id: Some(id.clone()),
+                                tool_name: Some(name.clone()),
+                                tool_input: Some(input.clone()),
+                                tool_output: None,
+                                is_error: None,
+                                input_tokens: None,
+                                output_tokens: None,
+                            });
+                        }
                         events.push(AssistantEvent::ToolUse { id, name, input });
                     }
                 }
                 ApiStreamEvent::MessageDelta(delta) => {
-                    events.push(AssistantEvent::Usage(delta.usage.token_usage()));
+                    let usage = delta.usage.token_usage();
+                    if let Some(emitter) = &self.event_emitter {
+                                let mut emitter = emitter.borrow_mut();
+                        emitter.emit(StructuredEvent {
+                            r#type: "usage".into(),
+                            text: None,
+                            tool_use_id: None,
+                            tool_name: None,
+                            tool_input: None,
+                            tool_output: None,
+                            is_error: None,
+                            input_tokens: Some(usage.input_tokens),
+                            output_tokens: Some(usage.output_tokens),
+                        });
+                    }
+                    events.push(AssistantEvent::Usage(usage));
                 }
                 ApiStreamEvent::MessageStop(_) => {
                     saw_stop = true;
@@ -13741,8 +13803,16 @@ fn run_structured_mode(
     let mut runtime = built
         .runtime
         .take()
-        .ok_or("Failed to build runtime")?
-        .with_event_emitter(Box::new(JsonEventEmitter));
+        .ok_or("Failed to build runtime")?;
+
+    // Wire up the JSON event emitter for real-time streaming.
+    // The runtime emitter handles post-turn events (usage, message_end, done).
+    // The API client emitter handles real-time per-token events.
+    let runtime_emitter = Box::new(JsonEventEmitter);
+    runtime = runtime.with_event_emitter(runtime_emitter);
+    // Also set an emitter on the API client for streaming events
+    let client_emitter = Box::new(JsonEventEmitter);
+    runtime.api_client_mut().set_event_emitter(client_emitter);
 
     // Emit ready event
     let ready = serde_json::json!({

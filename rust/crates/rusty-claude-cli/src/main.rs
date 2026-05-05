@@ -8000,7 +8000,7 @@ impl AnthropicRuntimeClient {
                             if let Some(emitter) = &self.event_emitter {
                                 let mut emitter = emitter.borrow_mut();
                                 emitter.emit(StructuredEvent {
-                                    r#type: "text".into(),
+                                    r#type: "thinking".into(),
                                     text: Some(text.clone()),
                                     tool_use_id: None,
                                     tool_name: None,
@@ -8027,7 +8027,7 @@ impl AnthropicRuntimeClient {
                         if let Some(emitter) = &self.event_emitter {
                                 let mut emitter = emitter.borrow_mut();
                             emitter.emit(StructuredEvent {
-                                r#type: "text".into(),
+                                r#type: "thinking".into(),
                                 text: Some(thinking.clone()),
                                 tool_use_id: None,
                                 tool_name: None,

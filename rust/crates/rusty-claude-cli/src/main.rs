@@ -13724,11 +13724,12 @@ fn run_structured_mode(
     session = session.with_workspace_root(cwd);
     let session_id = session.session_id.clone();
     let system_prompt = build_system_prompt()?;
+    let resolved_model = resolve_repl_model(model);
 
     let mut built = build_runtime(
         session,
         &session_id,
-        model.clone(),
+        resolved_model.clone(),
         system_prompt,
         true,  // enable_tools
         false, // emit_output — we emit via EventEmitter instead
@@ -13747,7 +13748,7 @@ fn run_structured_mode(
     let ready = serde_json::json!({
         "type": "ready",
         "session_id": runtime.session().session_id,
-        "model": model,
+        "model": resolved_model,
     });
     writeln!(std::io::stdout(), "{}", ready)?;
 
@@ -13795,7 +13796,7 @@ fn run_structured_mode(
                 }
             }
             StdinMessage::GetConfig => {
-                let current_model = runtime.session().model.clone().unwrap_or_else(|| model.clone());
+                let current_model = runtime.session().model.clone().unwrap_or_else(|| resolved_model.clone());
                 let config = serde_json::json!({
                     "type": "config",
                     "model": current_model,

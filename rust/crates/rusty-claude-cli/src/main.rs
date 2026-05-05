@@ -45,10 +45,11 @@ use runtime::{
     check_base_commit, format_stale_base_warning, format_usd, load_oauth_credentials,
     load_system_prompt, pricing_for_model, resolve_expected_base, resolve_sandbox_status,
     ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
-    ContentBlock, ConversationMessage, ConversationRuntime, McpServer, McpServerManager,
-    McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode, PermissionPolicy,
-    ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
-    ToolError, ToolExecutor, UsageTracker,
+    ContentBlock, ConversationMessage, ConversationRuntime, EventEmitter, McpServer,
+    McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode,
+    PermissionPolicy, PermissionPrompter, ProjectContext, PromptCacheEvent,
+    ResolvedPermissionMode, RuntimeError, Session, StructuredEvent, TokenUsage, ToolError,
+    ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -466,6 +467,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         )?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
+        CliAction::Structured {
+            model,
+            allowed_tools,
+            permission_mode,
+        } => run_structured_mode(model, allowed_tools, permission_mode)?,
     }
     Ok(())
 }
@@ -572,6 +578,12 @@ enum CliAction {
     Help {
         output_format: CliOutputFormat,
     },
+    /// Structured JSON Lines mode for parent-process integration (Claudian).
+    Structured {
+        model: String,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -624,6 +636,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut base_commit: Option<String> = None;
     let mut reasoning_effort: Option<String> = None;
     let mut allow_broad_cwd = false;
+    let mut wants_structured = false;
     let mut rest: Vec<String> = Vec::new();
     let mut index = 0;
 
@@ -674,6 +687,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     .ok_or_else(|| "missing value for --output-format".to_string())?;
                 output_format = CliOutputFormat::parse(value)?;
                 index += 2;
+            }
+            "--structured" => {
+                wants_structured = true;
+                index += 1;
             }
             "--permission-mode" => {
                 let value = args
@@ -806,6 +823,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     }
 
     let allowed_tools = normalize_allowed_tools(&allowed_tool_values)?;
+
+    if wants_structured {
+        return Ok(CliAction::Structured {
+            model,
+            allowed_tools,
+            permission_mode: permission_mode_override.unwrap_or(PermissionMode::DangerFullAccess),
+        });
+    }
 
     if rest.is_empty() {
         let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
@@ -7974,11 +7999,14 @@ impl AnthropicRuntimeClient {
                             input.push_str(&partial_json);
                         }
                     }
-                    ContentBlockDelta::ThinkingDelta { .. } => {
+                    ContentBlockDelta::ThinkingDelta { thinking } => {
                         if !block_has_thinking_summary {
                             render_thinking_block_summary(out, None, false)?;
                             block_has_thinking_summary = true;
                         }
+                        // Preserve the thinking text so it can be echoed back
+                        // to providers that require reasoning_content (e.g. DeepSeek).
+                        events.push(AssistantEvent::Reasoning(thinking));
                     }
                     ContentBlockDelta::SignatureDelta { .. } => {}
                 },
@@ -8905,6 +8933,7 @@ fn push_output_block(
         OutputContentBlock::Thinking { thinking, .. } => {
             render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
             *block_has_thinking_summary = true;
+            events.push(AssistantEvent::Reasoning(thinking));
         }
         OutputContentBlock::RedactedThinking { .. } => {
             render_thinking_block_summary(out, None, true)?;
@@ -9146,6 +9175,7 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             (!content.is_empty()).then(|| InputMessage {
                 role: role.to_string(),
                 content,
+                reasoning: message.reasoning.clone(),
             })
         })
         .collect()
@@ -13630,6 +13660,145 @@ mod sandbox_report_tests {
 
         assert!(abort_signal.is_aborted());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Structured mode — JSON Lines protocol for parent-process integration
+// ---------------------------------------------------------------------------
+
+use std::io::BufRead;
+
+/// A JSON event emitter that writes structured events as JSON Lines to stdout.
+struct JsonEventEmitter;
+
+impl EventEmitter for JsonEventEmitter {
+    fn emit(&mut self, event: StructuredEvent) {
+        let value = serde_json::json!({
+            "type": event.r#type,
+            "text": event.text,
+            "tool_use_id": event.tool_use_id,
+            "tool_name": event.tool_name,
+            "tool_input": event.tool_input,
+            "tool_output": event.tool_output,
+            "is_error": event.is_error,
+            "input_tokens": event.input_tokens,
+            "output_tokens": event.output_tokens,
+        });
+        // Filter out null fields for cleaner output
+        let filtered: serde_json::Value = match &value {
+            serde_json::Value::Object(map) => {
+                let filtered_map: serde_json::Map<String, serde_json::Value> = map
+                    .iter()
+                    .filter(|(_, v)| !v.is_null())
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                serde_json::Value::Object(filtered_map)
+            }
+            _ => value,
+        };
+        let _ = writeln!(std::io::stdout(), "{}", filtered);
+    }
+}
+
+/// Incoming message from stdin in structured mode.
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum StdinMessage {
+    #[serde(rename = "message")]
+    Message { role: String, content: String },
+    #[serde(rename = "session")]
+    Session { action: String, session_id: Option<String> },
+    #[serde(rename = "cancel")]
+    Cancel,
+}
+
+fn run_structured_mode(
+    model: String,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let mut session = Session::new();
+    session = session.with_workspace_root(cwd);
+    let session_id = session.session_id.clone();
+    let system_prompt = build_system_prompt()?;
+
+    let mut built = build_runtime(
+        session,
+        &session_id,
+        model.clone(),
+        system_prompt,
+        true,  // enable_tools
+        false, // emit_output — we emit via EventEmitter instead
+        allowed_tools,
+        permission_mode,
+        None,  // progress_reporter
+    )?;
+
+    let mut runtime = built
+        .runtime
+        .take()
+        .ok_or("Failed to build runtime")?
+        .with_event_emitter(Box::new(JsonEventEmitter));
+
+    // Emit ready event
+    let ready = serde_json::json!({
+        "type": "ready",
+        "session_id": runtime.session().session_id,
+        "model": model,
+    });
+    writeln!(std::io::stdout(), "{}", ready)?;
+
+    // Main stdin event loop
+    let stdin = std::io::stdin();
+    for line in stdin.lock().lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let msg: StdinMessage = match serde_json::from_str(&line) {
+            Ok(m) => m,
+            Err(e) => {
+                let err = serde_json::json!({
+                    "type": "error",
+                    "content": format!("invalid stdin message: {e}"),
+                });
+                writeln!(std::io::stdout(), "{}", err)?;
+                continue;
+            }
+        };
+
+        match msg {
+            StdinMessage::Message { role: _, content } => {
+                let mut prompter: Option<&mut dyn PermissionPrompter> = None;
+                match runtime.run_turn(content, prompter) {
+                    Ok(_summary) => {}
+                    Err(e) => {
+                        let err = serde_json::json!({
+                            "type": "error",
+                            "content": e.to_string(),
+                        });
+                        writeln!(std::io::stdout(), "{}", err)?;
+                    }
+                }
+            }
+            StdinMessage::Session { action, session_id: _ } => {
+                if action == "resume" {
+                    let info = serde_json::json!({
+                        "type": "session_info",
+                        "session_id": runtime.session().session_id,
+                    });
+                    writeln!(std::io::stdout(), "{}", info)?;
+                }
+            }
+            StdinMessage::Cancel => {
+                break;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

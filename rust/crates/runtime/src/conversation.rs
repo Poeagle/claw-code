@@ -34,6 +34,7 @@ pub enum AssistantEvent {
         name: String,
         input: String,
     },
+    Reasoning(String),
     Usage(TokenUsage),
     PromptCache(PromptCacheEvent),
     MessageStop,
@@ -122,6 +123,29 @@ pub struct AutoCompactionEvent {
     pub removed_message_count: usize,
 }
 
+/// A structured event emitted during a conversation turn for parent-process
+/// integration (e.g. `--structured` mode). Each variant maps to one JSON Lines
+/// event that a parent process can consume in real time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredEvent {
+    pub r#type: String,
+    pub text: Option<String>,
+    pub tool_use_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub tool_input: Option<String>,
+    pub tool_output: Option<String>,
+    pub is_error: Option<bool>,
+    pub input_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
+}
+
+/// Optional sink for structured events. When set, [`ConversationRuntime`]
+/// emits a JSON-serializable event at each significant step so a parent
+/// process can stream progress to the user in real time.
+pub trait EventEmitter {
+    fn emit(&mut self, event: StructuredEvent);
+}
+
 /// Coordinates the model loop, tool execution, hooks, and session updates.
 pub struct ConversationRuntime<C, T> {
     session: Session,
@@ -136,6 +160,7 @@ pub struct ConversationRuntime<C, T> {
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
+    event_emitter: Option<Box<dyn EventEmitter>>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -185,7 +210,14 @@ where
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
+            event_emitter: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_event_emitter(mut self, emitter: Box<dyn EventEmitter>) -> Self {
+        self.event_emitter = Some(emitter);
+        self
     }
 
     #[must_use]
@@ -372,6 +404,40 @@ where
                 self.usage_tracker.record(usage);
             }
             prompt_cache_events.extend(turn_prompt_cache_events);
+
+            // Emit structured events for each block in the assistant message
+            for block in &assistant_message.blocks {
+                match block {
+                    ContentBlock::Text { text } => {
+                        self.emit_event(StructuredEvent {
+                            r#type: "text".into(),
+                            text: Some(text.clone()),
+                            tool_use_id: None,
+                            tool_name: None,
+                            tool_input: None,
+                            tool_output: None,
+                            is_error: None,
+                            input_tokens: None,
+                            output_tokens: None,
+                        });
+                    }
+                    ContentBlock::ToolUse { id, name, input } => {
+                        self.emit_event(StructuredEvent {
+                            r#type: "tool_use".into(),
+                            text: None,
+                            tool_use_id: Some(id.clone()),
+                            tool_name: Some(name.clone()),
+                            tool_input: Some(input.clone()),
+                            tool_output: None,
+                            is_error: None,
+                            input_tokens: None,
+                            output_tokens: None,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+
             let pending_tool_uses = assistant_message
                 .blocks
                 .iter()
@@ -491,6 +557,33 @@ where
                         true,
                     ),
                 };
+                // Emit structured tool_result event
+                let is_err = result_message.blocks.first().is_some_and(|b| {
+                    matches!(b, ContentBlock::ToolResult { is_error: true, .. })
+                });
+                self.emit_event(StructuredEvent {
+                    r#type: "tool_result".into(),
+                    text: None,
+                    tool_use_id: result_message.blocks.first().and_then(|b| {
+                        if let ContentBlock::ToolResult { tool_use_id, .. } = b {
+                            Some(tool_use_id.clone())
+                        } else { None }
+                    }),
+                    tool_name: result_message.blocks.first().and_then(|b| {
+                        if let ContentBlock::ToolResult { tool_name, .. } = b {
+                            Some(tool_name.clone())
+                        } else { None }
+                    }),
+                    tool_input: None,
+                    tool_output: result_message.blocks.first().and_then(|b| {
+                        if let ContentBlock::ToolResult { output, .. } = b {
+                            Some(output.clone())
+                        } else { None }
+                    }),
+                    is_error: Some(is_err),
+                    input_tokens: None,
+                    output_tokens: None,
+                });
                 self.session
                     .push_message(result_message.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -510,6 +603,42 @@ where
             auto_compaction,
         };
         self.record_turn_completed(&summary);
+
+        // Emit end-of-turn structured events
+        let usage = self.usage_tracker.cumulative_usage();
+        self.emit_event(StructuredEvent {
+            r#type: "usage".into(),
+            text: None,
+            tool_use_id: None,
+            tool_name: None,
+            tool_input: None,
+            tool_output: None,
+            is_error: None,
+            input_tokens: Some(usage.input_tokens),
+            output_tokens: Some(usage.output_tokens),
+        });
+        self.emit_event(StructuredEvent {
+            r#type: "message_end".into(),
+            text: None,
+            tool_use_id: None,
+            tool_name: None,
+            tool_input: None,
+            tool_output: None,
+            is_error: None,
+            input_tokens: None,
+            output_tokens: None,
+        });
+        self.emit_event(StructuredEvent {
+            r#type: "done".into(),
+            text: None,
+            tool_use_id: None,
+            tool_name: None,
+            tool_input: None,
+            tool_output: None,
+            is_error: None,
+            input_tokens: None,
+            output_tokens: None,
+        });
 
         Ok(summary)
     }
@@ -575,6 +704,12 @@ where
         Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
         })
+    }
+
+    fn emit_event(&mut self, event: StructuredEvent) {
+        if let Some(emitter) = &mut self.event_emitter {
+            emitter.emit(event);
+        }
     }
 
     fn record_turn_started(&self, user_input: &str) {
@@ -718,6 +853,7 @@ fn build_assistant_message(
     let mut prompt_cache_events = Vec::new();
     let mut finished = false;
     let mut usage = None;
+    let mut reasoning = None;
 
     for event in events {
         match event {
@@ -725,6 +861,9 @@ fn build_assistant_message(
             AssistantEvent::ToolUse { id, name, input } => {
                 flush_text_block(&mut text, &mut blocks);
                 blocks.push(ContentBlock::ToolUse { id, name, input });
+            }
+            AssistantEvent::Reasoning(reasoning_text) => {
+                reasoning = Some(reasoning_text);
             }
             AssistantEvent::Usage(value) => usage = Some(value),
             AssistantEvent::PromptCache(event) => prompt_cache_events.push(event),
@@ -745,8 +884,12 @@ fn build_assistant_message(
         return Err(RuntimeError::new("assistant stream produced no content"));
     }
 
+    let mut message = ConversationMessage::assistant_with_usage(blocks, usage);
+    if let Some(reasoning) = reasoning {
+        message = message.with_reasoning(reasoning);
+    }
     Ok((
-        ConversationMessage::assistant_with_usage(blocks, usage),
+        message,
         usage,
         prompt_cache_events,
     ))

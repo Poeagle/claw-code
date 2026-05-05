@@ -45,6 +45,8 @@ impl MessageRequest {
 pub struct InputMessage {
     pub role: String,
     pub content: Vec<InputContentBlock>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 impl InputMessage {
@@ -53,6 +55,7 @@ impl InputMessage {
         Self {
             role: "user".to_string(),
             content: vec![InputContentBlock::Text { text: text.into() }],
+            reasoning: None,
         }
     }
 
@@ -71,6 +74,7 @@ impl InputMessage {
                 }],
                 is_error,
             }],
+            reasoning: None,
         }
     }
 }

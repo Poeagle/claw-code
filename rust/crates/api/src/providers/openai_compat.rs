@@ -493,7 +493,16 @@ impl StreamState {
         }
 
         for choice in chunk.choices {
-            if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
+            // reasoning_content: emit as ThinkingDelta so the runtime can
+            // track it separately and echo it back in subsequent requests.
+            if let Some(reasoning) = choice.delta.reasoning_content.as_deref().filter(|s| !s.is_empty()) {
+                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                    index: 0,
+                    delta: ContentBlockDelta::ThinkingDelta { thinking: reasoning.to_string() },
+                }));
+            }
+
+            if let Some(content) = choice.delta.content.as_deref().filter(|s| !s.is_empty()) {
                 if !self.text_started {
                     self.text_started = true;
                     events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
@@ -505,7 +514,7 @@ impl StreamState {
                 }
                 events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
                     index: 0,
-                    delta: ContentBlockDelta::TextDelta { text: content },
+                    delta: ContentBlockDelta::TextDelta { text: content.to_string() },
                 }));
             }
 
@@ -735,6 +744,12 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    /// DeepSeek reasoning content extension.
+    /// Some providers (DeepSeek) send reasoning/thinking content in this field.
+    /// We merge it into the regular text content so it's preserved in the
+    /// conversation history and echoed back in subsequent requests.
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<DeltaToolCall>,
 }
@@ -968,12 +983,18 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
             } else {
                 let mut msg = serde_json::json!({
                     "role": "assistant",
-                    "content": (!text.is_empty()).then_some(text),
+                    "content": (!text.is_empty()).then_some(text.clone()),
                 });
                 // Only include tool_calls when non-empty: some providers reject
                 // assistant messages with an explicit empty tool_calls array.
                 if !tool_calls.is_empty() {
                     msg["tool_calls"] = json!(tool_calls);
+                }
+                // Include reasoning_content when the model used reasoning.
+                // Some providers (DeepSeek) require this field to be echoed
+                // back from previous assistant turns.
+                if let Some(reasoning) = &message.reasoning {
+                    msg["reasoning_content"] = json!(reasoning);
                 }
                 vec![msg]
             }

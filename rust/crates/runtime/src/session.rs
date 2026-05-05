@@ -49,6 +49,7 @@ pub struct ConversationMessage {
     pub role: MessageRole,
     pub blocks: Vec<ContentBlock>,
     pub usage: Option<TokenUsage>,
+    pub reasoning: Option<String>,
 }
 
 /// Metadata describing the latest compaction that summarized a session.
@@ -628,6 +629,7 @@ impl ConversationMessage {
             role: MessageRole::User,
             blocks: vec![ContentBlock::Text { text: text.into() }],
             usage: None,
+            reasoning: None,
         }
     }
 
@@ -637,16 +639,27 @@ impl ConversationMessage {
             role: MessageRole::Assistant,
             blocks,
             usage: None,
+            reasoning: None,
         }
     }
 
     #[must_use]
-    pub fn assistant_with_usage(blocks: Vec<ContentBlock>, usage: Option<TokenUsage>) -> Self {
+    pub fn assistant_with_usage(
+        blocks: Vec<ContentBlock>,
+        usage: Option<TokenUsage>,
+    ) -> Self {
         Self {
             role: MessageRole::Assistant,
             blocks,
             usage,
+            reasoning: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_reasoning(mut self, reasoning: String) -> Self {
+        self.reasoning = Some(reasoning);
+        self
     }
 
     #[must_use]
@@ -665,6 +678,7 @@ impl ConversationMessage {
                 is_error,
             }],
             usage: None,
+            reasoning: None,
         }
     }
 
@@ -689,6 +703,12 @@ impl ConversationMessage {
         );
         if let Some(usage) = self.usage {
             object.insert("usage".to_string(), usage_to_json(usage));
+        }
+        if let Some(reasoning) = &self.reasoning {
+            object.insert(
+                "reasoning".to_string(),
+                JsonValue::String(reasoning.clone()),
+            );
         }
         JsonValue::Object(object)
     }
@@ -720,10 +740,15 @@ impl ConversationMessage {
             .map(ContentBlock::from_json)
             .collect::<Result<Vec<_>, _>>()?;
         let usage = object.get("usage").map(usage_from_json).transpose()?;
+        let reasoning = object
+            .get("reasoning")
+            .and_then(JsonValue::as_str)
+            .map(String::from);
         Ok(Self {
             role,
             blocks,
             usage,
+            reasoning,
         })
     }
 }
